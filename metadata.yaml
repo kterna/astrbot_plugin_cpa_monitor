@@ -1,0 +1,6 @@
+name: astrbot_plugin_cpa_monitor
+display_name: CPA 配额与健康度监控
+version: 1.0.0
+author: kterna
+desc: 监控 CLIProxyAPI (CPA) 凭据池配额、健康度与异常事件，支持指令查询与运维概览
+repo: https://github.com/kterna/astrbot_plugin_cpa_monitor

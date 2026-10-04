@@ -1,5 +1,6 @@
 import aiohttp
 import asyncio
+import re
 from typing import AsyncGenerator, Optional, Dict, Any, List
 
 from astrbot.api import AstrBotConfig, logger
@@ -7,11 +8,37 @@ from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
 from astrbot.api.star import Context, Star, register
 
 
+def mask_account(identifier: str) -> str:
+    """对账号标识（邮箱/文件名）进行脱敏显示"""
+    if not identifier:
+        return "***"
+    raw = identifier
+    if raw.endswith(".json"):
+        raw = raw[:-5]
+
+    # 提取内部邮箱
+    email_match = re.search(r'([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)', raw)
+    if email_match:
+        email = email_match.group(1)
+        user_part, domain = email.split("@", 1)
+        if len(user_part) <= 2:
+            masked_user = user_part[0] + "*"
+        elif len(user_part) <= 4:
+            masked_user = user_part[0] + "**" + user_part[-1]
+        else:
+            masked_user = user_part[:2] + "****" + user_part[-2:]
+        return f"{masked_user}@{domain}"
+
+    if len(raw) <= 4:
+        return raw[0] + "**"
+    return raw[:2] + "****" + raw[-2:]
+
+
 @register(
     "astrbot_plugin_cpa_monitor",
     "kterna",
     "CLIProxyAPI 配额与池健康度监控插件",
-    "1.1.0",
+    "1.1.1",
     "https://github.com/kterna/astrbot_plugin_cpa_monitor",
 )
 class CPAMonitorPlugin(Star):
@@ -67,8 +94,8 @@ class CPAMonitorPlugin(Star):
         """
         CPA 监控主指令:
         /cpa quota [refresh]       - 查看凭据池总额度概览
-        /cpa list [refresh]        - 列出所有账号及各账号剩余额度
-        /cpa account <关键词>       - 查看指定账号模型/窗口额度明细
+        /cpa list [refresh]        - 列出所有账号及各账号剩余额度 (脱敏)
+        /cpa account <关键词>       - 查看指定账号模型/窗口额度明细 (脱敏)
         /cpa health                - 查看账号池健康度与容量
         /cpa incidents             - 查看最近的 429/401 等异常事件
         /cpa status                - 查看插件运行与缓存状态
@@ -88,9 +115,9 @@ class CPAMonitorPlugin(Star):
                 "📊 【CPA 监控插件指令帮助】\n"
                 "• /cpa quota           - 查看账号额度概览\n"
                 "• /cpa quota refresh   - 强制刷新上游额度并查看概览\n"
-                "• /cpa list            - 列出所有账号及剩余额度百分比\n"
+                "• /cpa list            - 列出所有账号及剩余额度 (脱敏)\n"
                 "• /cpa list refresh    - 实时探测并列出全部账号额度\n"
-                "• /cpa account <关键词> - 查看匹配账号的详细模型/窗口配额\n"
+                "• /cpa account <关键词> - 查看匹配账号的详细配额 (脱敏)\n"
                 "• /cpa health          - 查看凭据池健康度与可路由容量\n"
                 "• /cpa incidents       - 查看最近请求异常记录\n"
                 "• /cpa status          - 查看插件运行与缓存状态"
@@ -115,7 +142,7 @@ class CPAMonitorPlugin(Star):
                 prov_lines = " | ".join([f"{k}: {v}" for k, v in by_prov.items()]) or "无"
                 stat_lines = " | ".join([f"{k}: {v}" for k, v in by_stat.items()]) or "无"
 
-                # 计算总剩余平均配额（Codex 窗口或 Antigravity/Gemini 模型）
+                # 计算总剩余平均配额
                 all_percents = []
                 for acc in accounts:
                     if acc.get("windows"):
@@ -160,10 +187,8 @@ class CPAMonitorPlugin(Star):
 
                 lines = [f"📋 【CPA 账号池剩余额度列表 (共 {len(accounts)} 个)】"]
                 for i, acc in enumerate(accounts, 1):
-                    email = acc.get("email") or acc.get("name") or "未知"
-                    # 脱敏过长文件名
-                    if email.endswith(".json"):
-                        email = email.split(".json")[0]
+                    raw_id = acc.get("email") or acc.get("name") or "未知"
+                    masked_id = mask_account(raw_id)
                     prov = acc.get("provider", "未知")
                     status = acc.get("status", "unknown")
                     stat_icon = "🟢" if status == "available" else ("🔴" if status == "exhausted" else "🟡")
@@ -176,14 +201,14 @@ class CPAMonitorPlugin(Star):
                             rem = w.get("remaining_percent", "N/A")
                             quota_info.append(f"{wid}: {rem}%")
                     elif acc.get("models"):
-                        # Gemini / Antigravity: 取部分代表性模型或均值
+                        # Gemini / Antigravity: 计算均值
                         model_rems = [float(m["remaining_percent"]) for m in acc["models"] if "remaining_percent" in m]
                         if model_rems:
                             avg_m = sum(model_rems) / len(model_rems)
                             quota_info.append(f"模型均值: {avg_m:.1f}%")
-                    
+
                     quota_str = ", ".join(quota_info) if quota_info else "无额度数据"
-                    lines.append(f"{i}. {stat_icon} [{prov}] {email}\n   └ 剩余: {quota_str}")
+                    lines.append(f"{i}. {stat_icon} [{prov}] {masked_id}\n   └ 剩余: {quota_str}")
 
                 yield event.plain_result("\n".join(lines))
             except Exception as e:
@@ -209,14 +234,15 @@ class CPAMonitorPlugin(Star):
                     return
 
                 acc = matched[0]
-                email = acc.get("email") or acc.get("name")
+                raw_id = acc.get("email") or acc.get("name")
+                masked_id = mask_account(raw_id)
                 prov = acc.get("provider", "未知")
                 status = acc.get("status", "未知")
                 plan = acc.get("plan", "标准")
 
                 lines = [
                     f"👤 【账号额度详情】",
-                    f"• 账号标识: {email}",
+                    f"• 账号标识: {masked_id}",
                     f"• 提供商: {prov} | 计划: {plan}",
                     f"• 运行状态: {status} | 凭据: {acc.get('credential_state', 'active')}",
                     "─────────────────"

@@ -11,7 +11,7 @@ from astrbot.api.star import Context, Star, register
     "astrbot_plugin_cpa_monitor",
     "kterna",
     "CLIProxyAPI 配额与池健康度监控插件",
-    "1.0.1",
+    "1.0.2",
     "https://github.com/kterna/astrbot_plugin_cpa_monitor",
 )
 class CPAMonitorPlugin(Star):
@@ -27,13 +27,21 @@ class CPAMonitorPlugin(Star):
     def __init__(self, context: Context, config: Optional[AstrBotConfig] = None):
         super().__init__(context)
         self.config = config or {}
-        self.cpa_base_url = self.config.get("cpa_base_url", "http://127.0.0.1:8317").rstrip("/")
+        raw_url = self.config.get("cpa_base_url", "https://cpa.kterna.top").rstrip("/")
+        # 兼容用户直接粘贴完整管理面板 URL
+        if "/management.html" in raw_url:
+            raw_url = raw_url.split("/management.html")[0]
+        self.cpa_base_url = raw_url
         self.management_key = self.config.get("management_key", "")
         self.timeout = float(self.config.get("timeout", 15))
         logger.info(f"CPA 监控插件已加载 (Target: {self.cpa_base_url})")
 
     def _get_headers(self) -> Dict[str, str]:
-        headers = {"Accept": "application/json"}
+        # 附带标准浏览器 User-Agent，避免 Cloudflare 默认 WAF 规则拦截
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
         if self.management_key:
             headers["Authorization"] = f"Bearer {self.management_key}"
             headers["X-Management-Key"] = self.management_key
@@ -49,7 +57,8 @@ class CPAMonitorPlugin(Star):
                 timeout=aiohttp.ClientTimeout(total=self.timeout)
             ) as resp:
                 if resp.status in (401, 403):
-                    raise PermissionError(f"CPA 鉴权失败 (HTTP {resp.status})，请检查 management_key 配置")
+                    text = await resp.text()
+                    raise PermissionError(f"CPA 鉴权或防火墙拦截 (HTTP {resp.status}): {text[:150]}")
                 if resp.status != 200:
                     text = await resp.text()
                     raise RuntimeError(f"CPA 返回异常 [HTTP {resp.status}]: {text[:200]}")
@@ -64,11 +73,9 @@ class CPAMonitorPlugin(Star):
         /cpa incidents       - 查看最近的 429/401 等异常事件
         /cpa status          - 查看 CPA Quota 插件运行状态
         """
-        # 解析指令后缀参数
         msg = event.get_message_str().strip()
         parts = [p for p in msg.split() if p]
-        
-        # 兼容用户发送 "/cpa ..." 或 "cpa ..."
+
         sub = ""
         arg = ""
         if len(parts) >= 2:

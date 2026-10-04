@@ -11,7 +11,7 @@ from astrbot.api.star import Context, Star, register
     "astrbot_plugin_cpa_monitor",
     "kterna",
     "CLIProxyAPI 配额与池健康度监控插件",
-    "1.0.0",
+    "1.0.1",
     "https://github.com/kterna/astrbot_plugin_cpa_monitor",
 )
 class CPAMonitorPlugin(Star):
@@ -36,6 +36,7 @@ class CPAMonitorPlugin(Star):
         headers = {"Accept": "application/json"}
         if self.management_key:
             headers["Authorization"] = f"Bearer {self.management_key}"
+            headers["X-Management-Key"] = self.management_key
         return headers
 
     async def _fetch_json(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -55,9 +56,7 @@ class CPAMonitorPlugin(Star):
                 return await resp.json()
 
     @filter.command("cpa")
-    async def cpa_command(
-        self, event: AstrMessageEvent, sub: str = "", arg: str = ""
-    ) -> AsyncGenerator[MessageEventResult, None]:
+    async def cpa_command(self, event: AstrMessageEvent) -> AsyncGenerator[MessageEventResult, None]:
         """
         CPA 监控主指令:
         /cpa quota [refresh] - 查看凭据池额度与状态分布
@@ -65,7 +64,17 @@ class CPAMonitorPlugin(Star):
         /cpa incidents       - 查看最近的 429/401 等异常事件
         /cpa status          - 查看 CPA Quota 插件运行状态
         """
-        sub = sub.strip().lower()
+        # 解析指令后缀参数
+        msg = event.get_message_str().strip()
+        parts = [p for p in msg.split() if p]
+        
+        # 兼容用户发送 "/cpa ..." 或 "cpa ..."
+        sub = ""
+        arg = ""
+        if len(parts) >= 2:
+            sub = parts[1].lower()
+        if len(parts) >= 3:
+            arg = parts[2].lower()
 
         if not sub or sub in ("help", "-h", "--help"):
             help_text = (
@@ -80,9 +89,9 @@ class CPAMonitorPlugin(Star):
             return
 
         if sub == "quota":
-            refresh = (arg.strip().lower() == "refresh")
-            msg = "🔄 正在查询 CPA 凭据池额度（实时扫描上游）..." if refresh else "🔄 正在获取 CPA 额度快照..."
-            yield event.plain_result(msg)
+            refresh = (arg == "refresh")
+            notice = "🔄 正在查询 CPA 凭据池额度（实时扫描上游）..." if refresh else "🔄 正在获取 CPA 额度快照..."
+            yield event.plain_result(notice)
             try:
                 params: Dict[str, Any] = {"limit": 1}
                 if refresh:

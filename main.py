@@ -1,6 +1,6 @@
 import aiohttp
 import asyncio
-from typing import AsyncGenerator, Optional, Dict, Any
+from typing import AsyncGenerator, Optional, Dict, Any, List
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
@@ -11,14 +11,14 @@ from astrbot.api.star import Context, Star, register
     "astrbot_plugin_cpa_monitor",
     "kterna",
     "CLIProxyAPI 配额与池健康度监控插件",
-    "1.0.2",
+    "1.1.0",
     "https://github.com/kterna/astrbot_plugin_cpa_monitor",
 )
 class CPAMonitorPlugin(Star):
     """
     CPA 配额与池健康度监控插件
     对接 cpa-quota-api-extension 扩展接口:
-    - /quotas: 凭据池额度快照与聚合
+    - /quotas: 凭据池额度快照、按账号列出与聚合
     - /health: 账号池健康度与可路由容量
     - /incidents: 最近的 429/401/403 等异常失败事件
     - /status: 插件运行状态
@@ -28,7 +28,6 @@ class CPAMonitorPlugin(Star):
         super().__init__(context)
         self.config = config or {}
         raw_url = self.config.get("cpa_base_url", "https://cpa.kterna.top").rstrip("/")
-        # 兼容用户直接粘贴完整管理面板 URL
         if "/management.html" in raw_url:
             raw_url = raw_url.split("/management.html")[0]
         self.cpa_base_url = raw_url
@@ -37,7 +36,6 @@ class CPAMonitorPlugin(Star):
         logger.info(f"CPA 监控插件已加载 (Target: {self.cpa_base_url})")
 
     def _get_headers(self) -> Dict[str, str]:
-        # 附带标准浏览器 User-Agent，避免 Cloudflare 默认 WAF 规则拦截
         headers = {
             "Accept": "application/json",
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -68,10 +66,12 @@ class CPAMonitorPlugin(Star):
     async def cpa_command(self, event: AstrMessageEvent) -> AsyncGenerator[MessageEventResult, None]:
         """
         CPA 监控主指令:
-        /cpa quota [refresh] - 查看凭据池额度与状态分布
-        /cpa health          - 查看账号池可用容量与健康度
-        /cpa incidents       - 查看最近的 429/401 等异常事件
-        /cpa status          - 查看 CPA Quota 插件运行状态
+        /cpa quota [refresh]       - 查看凭据池总额度概览
+        /cpa list [refresh]        - 列出所有账号及各账号剩余额度
+        /cpa account <关键词>       - 查看指定账号模型/窗口额度明细
+        /cpa health                - 查看账号池健康度与容量
+        /cpa incidents             - 查看最近的 429/401 等异常事件
+        /cpa status                - 查看插件运行与缓存状态
         """
         msg = event.get_message_str().strip()
         parts = [p for p in msg.split() if p]
@@ -86,8 +86,11 @@ class CPAMonitorPlugin(Star):
         if not sub or sub in ("help", "-h", "--help"):
             help_text = (
                 "📊 【CPA 监控插件指令帮助】\n"
-                "• /cpa quota           - 查看账号额度概览 (命中缓存)\n"
-                "• /cpa quota refresh   - 强制刷新上游额度并查看\n"
+                "• /cpa quota           - 查看账号额度概览\n"
+                "• /cpa quota refresh   - 强制刷新上游额度并查看概览\n"
+                "• /cpa list            - 列出所有账号及剩余额度百分比\n"
+                "• /cpa list refresh    - 实时探测并列出全部账号额度\n"
+                "• /cpa account <关键词> - 查看匹配账号的详细模型/窗口配额\n"
                 "• /cpa health          - 查看凭据池健康度与可路由容量\n"
                 "• /cpa incidents       - 查看最近请求异常记录\n"
                 "• /cpa status          - 查看插件运行与缓存状态"
@@ -100,32 +103,143 @@ class CPAMonitorPlugin(Star):
             notice = "🔄 正在查询 CPA 凭据池额度（实时扫描上游）..." if refresh else "🔄 正在获取 CPA 额度快照..."
             yield event.plain_result(notice)
             try:
-                params: Dict[str, Any] = {"limit": 1}
+                params: Dict[str, Any] = {"limit": 100}
                 if refresh:
                     params["refresh"] = "true"
                 data = await self._fetch_json("/quotas", params=params)
                 summary = data.get("summary", {})
                 by_prov = summary.get("by_provider", {})
                 by_stat = summary.get("by_status", {})
+                accounts = data.get("accounts", []) or []
 
                 prov_lines = " | ".join([f"{k}: {v}" for k, v in by_prov.items()]) or "无"
                 stat_lines = " | ".join([f"{k}: {v}" for k, v in by_stat.items()]) or "无"
 
+                # 计算总剩余平均配额（Codex 窗口或 Antigravity/Gemini 模型）
+                all_percents = []
+                for acc in accounts:
+                    if acc.get("windows"):
+                        for w in acc["windows"]:
+                            if "remaining_percent" in w:
+                                all_percents.append(float(w["remaining_percent"]))
+                    elif acc.get("models"):
+                        for m in acc["models"]:
+                            if "remaining_percent" in m:
+                                all_percents.append(float(m["remaining_percent"]))
+
+                avg_str = f"{sum(all_percents) / len(all_percents):.1f}%" if all_percents else "N/A"
                 cached_str = " (缓存)" if data.get("cached") else " (实时)"
                 reply = (
                     f"📈 【CPA 凭据池额度概况{cached_str}】\n"
-                    f"• 凭据总量: {summary.get('total', 0)}\n"
-                    f"• 正常可用: {summary.get('available', 0)}\n"
-                    f"• 额度耗尽: {summary.get('exhausted', 0)}\n"
-                    f"• 异常账号: {summary.get('errors', 0)}\n"
-                    f"• 禁用账号: {summary.get('disabled', 0)}\n"
+                    f"• 凭据总量: {summary.get('total', 0)} (正常: {summary.get('available', 0)} / 耗尽: {summary.get('exhausted', 0)})\n"
+                    f"• 凭据池平均剩余额度: {avg_str}\n"
+                    f"• 异常/禁用: 错误 {summary.get('errors', 0)} | 禁用 {summary.get('disabled', 0)}\n"
                     f"─────────────────\n"
-                    f"📦 提供商分布: {prov_lines}\n"
-                    f"🏷️ 状态分布: {stat_lines}"
+                    f"📦 提供商: {prov_lines}\n"
+                    f"🏷️ 状态分布: {stat_lines}\n"
+                    f"💡 输入 /cpa list 查看各账号具体剩余明细"
                 )
                 yield event.plain_result(reply)
             except Exception as e:
                 yield event.plain_result(f"❌ 查询额度失败: {str(e)}")
+
+        elif sub in ("list", "all", "ls"):
+            refresh = (arg == "refresh")
+            notice = "🔄 正在获取账号列表（实时刷新上游）..." if refresh else "🔄 正在获取账号额度列表..."
+            yield event.plain_result(notice)
+            try:
+                params = {"limit": 100}
+                if refresh:
+                    params["refresh"] = "true"
+                data = await self._fetch_json("/quotas", params=params)
+                accounts = data.get("accounts", []) or []
+
+                if not accounts:
+                    yield event.plain_result("⚠️ 未找到任何账号凭据。")
+                    return
+
+                lines = [f"📋 【CPA 账号池剩余额度列表 (共 {len(accounts)} 个)】"]
+                for i, acc in enumerate(accounts, 1):
+                    email = acc.get("email") or acc.get("name") or "未知"
+                    # 脱敏过长文件名
+                    if email.endswith(".json"):
+                        email = email.split(".json")[0]
+                    prov = acc.get("provider", "未知")
+                    status = acc.get("status", "unknown")
+                    stat_icon = "🟢" if status == "available" else ("🔴" if status == "exhausted" else "🟡")
+
+                    quota_info = []
+                    if acc.get("windows"):
+                        # Codex: 显示 primary / secondary 剩余百分比
+                        for w in acc["windows"]:
+                            wid = w.get("id", "win")
+                            rem = w.get("remaining_percent", "N/A")
+                            quota_info.append(f"{wid}: {rem}%")
+                    elif acc.get("models"):
+                        # Gemini / Antigravity: 取部分代表性模型或均值
+                        model_rems = [float(m["remaining_percent"]) for m in acc["models"] if "remaining_percent" in m]
+                        if model_rems:
+                            avg_m = sum(model_rems) / len(model_rems)
+                            quota_info.append(f"模型均值: {avg_m:.1f}%")
+                    
+                    quota_str = ", ".join(quota_info) if quota_info else "无额度数据"
+                    lines.append(f"{i}. {stat_icon} [{prov}] {email}\n   └ 剩余: {quota_str}")
+
+                yield event.plain_result("\n".join(lines))
+            except Exception as e:
+                yield event.plain_result(f"❌ 列出账号失败: {str(e)}")
+
+        elif sub in ("account", "acc", "user", "detail"):
+            keyword = arg.strip()
+            if not keyword:
+                yield event.plain_result("⚠️ 请输入要查询的账号关键词，例如: /cpa account qq.com 或 /cpa account qb07246")
+                return
+
+            yield event.plain_result(f"🔍 正在查询匹配 '{keyword}' 的账号额度详情...")
+            try:
+                data = await self._fetch_json("/quotas", params={"limit": 100})
+                accounts = data.get("accounts", []) or []
+                matched = [
+                    a for a in accounts
+                    if keyword in (a.get("email", "")).lower() or keyword in (a.get("name", "")).lower()
+                ]
+
+                if not matched:
+                    yield event.plain_result(f"❌ 未找到匹配 '{keyword}' 的账号，可使用 /cpa list 查看所有账号。")
+                    return
+
+                acc = matched[0]
+                email = acc.get("email") or acc.get("name")
+                prov = acc.get("provider", "未知")
+                status = acc.get("status", "未知")
+                plan = acc.get("plan", "标准")
+
+                lines = [
+                    f"👤 【账号额度详情】",
+                    f"• 账号标识: {email}",
+                    f"• 提供商: {prov} | 计划: {plan}",
+                    f"• 运行状态: {status} | 凭据: {acc.get('credential_state', 'active')}",
+                    "─────────────────"
+                ]
+
+                if acc.get("windows"):
+                    lines.append("⏳ 【配额窗口剩余】:")
+                    for w in acc["windows"]:
+                        wid = w.get("id", "默认")
+                        rem = w.get("remaining_percent", "N/A")
+                        reset = w.get("reset_at", "").replace("T", " ")[:19]
+                        lines.append(f"  • {wid}: 剩余 {rem}% (重置时间: {reset or '未知'})")
+
+                if acc.get("models"):
+                    lines.append("🤖 【各模型剩余额度】:")
+                    for m in acc["models"]:
+                        m_name = m.get("model", "未知")
+                        rem = m.get("remaining_percent", "N/A")
+                        lines.append(f"  • {m_name}: {rem}%")
+
+                yield event.plain_result("\n".join(lines))
+            except Exception as e:
+                yield event.plain_result(f"❌ 查询账号详情失败: {str(e)}")
 
         elif sub == "health":
             yield event.plain_result("🔄 正在获取账号池健康度...")
